@@ -55,7 +55,7 @@ import {
 
 import api, { clearAuthToken, getAuthToken, setAuthToken } from "./lib/api";
 
-const APP_NAME = import.meta.env.VITE_APP_NAME || "VELoopDO";
+const APP_NAME = import.meta.env.APP_NAME || "VELoopDO";
 
 const NAV_ITEMS = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
