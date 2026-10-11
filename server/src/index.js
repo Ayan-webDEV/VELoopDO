@@ -15,24 +15,34 @@ const app = express();
 const PORT = Number(process.env.PORT) || 5000;
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
-  .split(",")
-  .map((origin) => origin.trim())
+// Allowed frontend origins.
+// CLIENT_ORIGIN can contain multiple comma-separated URLs.
+const allowedOrigins = [
+  ...(process.env.CLIENT_ORIGIN || "http://localhost:5173").split(","),
+  "https://veloopdo.vercel.app",
+]
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
 app.disable("x-powered-by");
 
+// Security headers
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
 
+// CORS must run before API routes and rate limiting so browser
+// preflight requests receive the appropriate CORS headers.
 app.use(
   cors({
     origin(origin, callback) {
-      // Permit requests without an Origin header, such as server-side health checks.
-      if (!origin || allowedOrigins.includes(origin)) {
+      // Allow requests without an Origin header, such as server-side
+      // health checks, and explicitly approved frontend origins.
+      const normalizedOrigin = origin ? origin.replace(/\/+$/, "") : null;
+
+      if (!normalizedOrigin || allowedOrigins.includes(normalizedOrigin)) {
         return callback(null, true);
       }
 
@@ -41,12 +51,15 @@ app.use(
     credentials: true,
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204,
   }),
 );
 
+// Request parsing
 app.use(express.json({ limit: "100kb" }));
 app.use(express.urlencoded({ extended: false, limit: "100kb" }));
 
+// API rate limiting
 app.use(
   "/api",
   rateLimit({
@@ -61,6 +74,7 @@ app.use(
   }),
 );
 
+// Root endpoint
 app.get("/", (_req, res) => {
   res.status(200).json({
     success: true,
@@ -70,6 +84,7 @@ app.get("/", (_req, res) => {
   });
 });
 
+// Health check
 app.get("/api/health", (_req, res) => {
   const databaseState = mongoose.connection.readyState;
 
@@ -139,6 +154,7 @@ app.use((err, _req, res, _next) => {
   });
 });
 
+// Start server
 async function startServer() {
   if (!process.env.MONGODB_URI) {
     throw new Error("MONGODB_URI is missing from server/.env");
@@ -159,9 +175,10 @@ async function startServer() {
   });
 
   console.log("VELoopDO MongoDB connected.");
+  console.log("Allowed CORS origins:", allowedOrigins);
 
   const server = app.listen(PORT, () => {
-    console.log(`VELoopDO API listening on http://localhost:${PORT}`);
+    console.log(`VELoopDO API listening on port ${PORT}`);
     console.log(`Environment: ${NODE_ENV}`);
   });
 
@@ -188,6 +205,7 @@ async function startServer() {
   process.once("SIGTERM", () => shutdown("SIGTERM"));
 }
 
+// MongoDB connection monitoring
 mongoose.connection.on("error", (error) => {
   console.error("MongoDB connection error:", error.message);
 });
