@@ -5,6 +5,7 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   BarChart3,
+  BellRing,
   CalendarDays,
   Check,
   CheckCircle2,
@@ -82,6 +83,10 @@ const EMPTY_TASK = {
   priority: "medium",
   scheduledFor: "",
   dueAt: "",
+  workingDate: "",
+  workingStartTime: "",
+  workingEndTime: "",
+  alarmTimezone: "",
   linkTitle: "",
   linkUrl: "",
   assignedTo: "",
@@ -135,6 +140,36 @@ function toISOStringOrUndefined(value) {
 
 function getTaskId(task) {
   return task?._id || task?.id;
+}
+
+function taskRoleBucket(task) {
+  const assignee =
+    task?.assignedTo && typeof task.assignedTo === "object"
+      ? task.assignedTo
+      : null;
+  const designation = String(assignee?.designation || "").toLowerCase();
+  const role = String(assignee?.role || "").toLowerCase();
+
+  if (
+    designation.includes("founder") ||
+    designation.includes("ceo") ||
+    ["owner", "ceo"].includes(role)
+  ) {
+    return "founder";
+  }
+
+  if (designation.includes("marketing") || role.includes("marketing")) {
+    return "marketing";
+  }
+
+  return "other";
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = window.atob(base64);
+  return Uint8Array.from([...raw].map((character) => character.charCodeAt(0)));
 }
 
 function unwrapList(response, key) {
@@ -227,8 +262,21 @@ function buildTaskPayload(form) {
     ...(form.category === "future" && form.scheduledFor
       ? { scheduledFor: new Date(form.scheduledFor).toISOString() }
       : {}),
-    ...(form.dueAt ? { dueAt: new Date(form.dueAt).toISOString() } : {}),
-    ...(form.assignedTo ? { assignedTo: form.assignedTo } : {}),
+    dueAt: form.dueAt ? new Date(form.dueAt).toISOString() : null,
+    workingDate:
+      form.category === "daily"
+        ? null
+        : form.workingDate ||
+          (form.category === "future" && form.scheduledFor
+            ? form.scheduledFor.slice(0, 10)
+            : null),
+    workingStartTime: form.workingStartTime || null,
+    workingEndTime: form.workingEndTime || null,
+    alarmTimezone:
+      form.alarmTimezone ||
+      Intl.DateTimeFormat().resolvedOptions().timeZone ||
+      "Asia/Kolkata",
+    assignedTo: form.assignedTo || null,
   };
 }
 
@@ -266,6 +314,10 @@ function App() {
   const [priorityFilter, setPriorityFilter] = useState("all");
   const [historyStatus, setHistoryStatus] = useState("all");
   const [analyticsRange, setAnalyticsRange] = useState("week");
+  const [taskRoleFilter, setTaskRoleFilter] = useState("all");
+  const [analyticsRoleFilter, setAnalyticsRoleFilter] = useState("all");
+  const [notificationStatus, setNotificationStatus] = useState("unknown");
+  const [alarmTask, setAlarmTask] = useState(null);
 
   const [modal, setModal] = useState(null);
   const [taskForm, setTaskForm] = useState(EMPTY_TASK);
@@ -436,7 +488,7 @@ function App() {
           api.get("/tasks"),
           api.get("/tasks/history"),
           api.get("/analytics/overview", {
-            params: { range: analyticsRange },
+            params: { range: analyticsRange, role: analyticsRoleFilter },
           }),
         ]);
 
@@ -460,13 +512,206 @@ function App() {
     } finally {
       setDataLoading(false);
     }
-  }, [analyticsRange]);
+  }, [analyticsRange, analyticsRoleFilter]);
 
   useEffect(() => {
     if (!user) return;
 
     loadWorkspace();
   }, [user, loadWorkspace]);
+
+  const enableAlarmNotifications = useCallback(async () => {
+    try {
+      if (
+        !("serviceWorker" in navigator) ||
+        !("PushManager" in window) ||
+        !("Notification" in window)
+      ) {
+        throw new Error(
+          "This browser does not support background push notifications.",
+        );
+      }
+
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        setNotificationStatus("denied");
+        throw new Error(
+          "Allow notifications in your browser settings to enable alarms.",
+        );
+      }
+
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      await navigator.serviceWorker.ready;
+
+      const keyResponse = await api.get("/notifications/vapid-public-key");
+      const publicKey = keyResponse?.publicKey || keyResponse?.data?.publicKey;
+
+      if (!publicKey) {
+        throw new Error(
+          "Push notifications are not configured on the backend yet.",
+        );
+      }
+
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey),
+        });
+      }
+
+      await api.post("/notifications/subscribe", {
+        subscription: subscription.toJSON(),
+      });
+
+      setNotificationStatus("enabled");
+      pushToast("Background task alarms are enabled.");
+    } catch (error) {
+      setNotificationStatus((current) =>
+        current === "denied" ? current : "error",
+      );
+      pushToast(getErrorMessage(error), "error");
+    }
+  }, [pushToast]);
+
+  const handleAlarmAction = useCallback(
+    async (task, action) => {
+      if (!task) return;
+
+      try {
+        await api.post(`/tasks/${getTaskId(task)}/reminder-action`, {
+          action,
+        });
+        setAlarmTask(null);
+        setModal(null);
+        pushToast(
+          action === "working"
+            ? "Alarm acknowledged. Good luck with the task!"
+            : "Reminder snoozed for 7 minutes.",
+        );
+        await loadWorkspace();
+      } catch (error) {
+        pushToast(getErrorMessage(error), "error");
+      }
+    },
+    [loadWorkspace, pushToast],
+  );
+
+  useEffect(() => {
+    if (!user) return;
+
+    const params = new URLSearchParams(window.location.search);
+    const taskId = params.get("taskId");
+    const action = params.get("alarmAction");
+    if (!taskId) return;
+
+    const task = tasks.find((item) => String(getTaskId(item)) === taskId);
+
+    // A notification action can be handled even before the task list finishes loading.
+    if (action && ["working", "snooze"].includes(action)) {
+      const cleanUrl = new URL(window.location.href);
+      cleanUrl.searchParams.delete("taskId");
+      cleanUrl.searchParams.delete("alarmAction");
+      window.history.replaceState(
+        {},
+        "",
+        cleanUrl.pathname + cleanUrl.search + cleanUrl.hash,
+      );
+
+      if (task) {
+        void handleAlarmAction(task, action);
+      } else {
+        void api
+          .post(`/tasks/${taskId}/reminder-action`, { action })
+          .then(() => loadWorkspace())
+          .catch((error) => pushToast(getErrorMessage(error), "error"));
+      }
+      return;
+    }
+
+    if (task) {
+      const cleanUrl = new URL(window.location.href);
+      cleanUrl.searchParams.delete("taskId");
+      cleanUrl.searchParams.delete("alarmAction");
+      window.history.replaceState(
+        {},
+        "",
+        cleanUrl.pathname + cleanUrl.search + cleanUrl.hash,
+      );
+      setAlarmTask(task);
+      setModal("alarm");
+    }
+  }, [user, tasks, handleAlarmAction, loadWorkspace, pushToast]);
+
+  useEffect(() => {
+    if (!user || alarmTask || modal) return;
+
+    const checkForAlarm = () => {
+      const now = new Date();
+
+      const dueTask = tasks.find((task) => {
+        if (
+          task.status !== "pending" ||
+          task.isRecurringTemplate ||
+          !task.workingStartTime ||
+          !task.workingEndTime
+        ) {
+          return false;
+        }
+
+        if (task.alarm?.acknowledgedAt || task.alarm?.workingStartedAt) {
+          return false;
+        }
+
+        if (
+          task.alarm?.nextReminderAt &&
+          new Date(task.alarm.nextReminderAt) > now
+        ) {
+          return false;
+        }
+
+        const timezone =
+          task.alarmTimezone || company?.timezone || "Asia/Kolkata";
+        let parts;
+        try {
+          parts = new Intl.DateTimeFormat("en-CA", {
+            timeZone: timezone,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            hourCycle: "h23",
+          }).formatToParts(now);
+        } catch {
+          return false;
+        }
+
+        const values = Object.fromEntries(
+          parts.map((part) => [part.type, part.value]),
+        );
+        const dateKey = `${values.year}-${values.month}-${values.day}`;
+        const timeKey = `${values.hour}:${values.minute}`;
+        const taskDate =
+          task.category === "daily" ? task.occurrenceDate : task.workingDate;
+
+        return (
+          taskDate === dateKey &&
+          timeKey >= task.workingStartTime &&
+          timeKey <= task.workingEndTime
+        );
+      });
+
+      if (dueTask) {
+        setAlarmTask(dueTask);
+        setModal("alarm");
+      }
+    };
+
+    checkForAlarm();
+    const interval = window.setInterval(checkForAlarm, 15000);
+    return () => window.clearInterval(interval);
+  }, [user, tasks, alarmTask, modal, company]);
 
   const members = useMemo(() => {
     const sources = [
@@ -513,6 +758,13 @@ function App() {
       result = result.filter((task) => task.priority === priorityFilter);
     }
 
+    if (
+      taskRoleFilter !== "all" &&
+      ["daily", "fixed", "future"].includes(activePage)
+    ) {
+      result = result.filter((task) => taskRoleBucket(task) === taskRoleFilter);
+    }
+
     const normalizedSearch = search.trim().toLowerCase();
 
     if (normalizedSearch) {
@@ -532,7 +784,7 @@ function App() {
     }
 
     return sortTasks(result);
-  }, [tasks, activePage, priorityFilter, search]);
+  }, [tasks, activePage, priorityFilter, taskRoleFilter, search]);
 
   const visibleHistory = useMemo(() => {
     let result = historyTasks;
@@ -626,7 +878,12 @@ function App() {
 
   const openNewTask = (category = "fixed") => {
     setEditingTask(null);
-    setTaskForm({ ...EMPTY_TASK, category });
+    setTaskForm({
+      ...EMPTY_TASK,
+      category,
+      alarmTimezone:
+        Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",
+    });
     setActionError("");
     setModal("task");
   };
@@ -645,6 +902,13 @@ function App() {
       priority: task.priority || "medium",
       scheduledFor: toLocalInput(task.scheduledFor),
       dueAt: toLocalInput(task.dueAt),
+      workingDate: task.workingDate || "",
+      workingStartTime: task.workingStartTime || "",
+      workingEndTime: task.workingEndTime || "",
+      alarmTimezone:
+        task.alarmTimezone ||
+        Intl.DateTimeFormat().resolvedOptions().timeZone ||
+        "Asia/Kolkata",
       linkTitle: firstLink?.title || "",
       linkUrl: firstLink?.url || "",
       assignedTo:
@@ -672,6 +936,32 @@ function App() {
 
     if (taskForm.category === "future" && !taskForm.scheduledFor) {
       setActionError("Choose a date and time for future work.");
+      return;
+    }
+
+    if (
+      Boolean(taskForm.workingStartTime) !== Boolean(taskForm.workingEndTime)
+    ) {
+      setActionError("Choose both a working start and end time for the alarm.");
+      return;
+    }
+
+    if (
+      taskForm.workingStartTime &&
+      taskForm.workingEndTime &&
+      taskForm.workingEndTime <= taskForm.workingStartTime
+    ) {
+      setActionError("Working end time must be later than the start time.");
+      return;
+    }
+
+    if (
+      taskForm.workingStartTime &&
+      taskForm.category !== "daily" &&
+      !taskForm.workingDate &&
+      !taskForm.scheduledFor
+    ) {
+      setActionError("Choose a working date for this task's alarm.");
       return;
     }
 
@@ -777,6 +1067,7 @@ function App() {
     setDrawerOpen(false);
     setSearch("");
     setPriorityFilter("all");
+    setTaskRoleFilter("all");
   };
 
   if (authChecking) {
@@ -1108,6 +1399,8 @@ function App() {
                 analyticsRange={analyticsRange}
                 setAnalyticsRange={setAnalyticsRange}
                 dataLoading={dataLoading}
+                onEnableNotifications={enableAlarmNotifications}
+                notificationStatus={notificationStatus}
                 onNavigate={changePage}
                 onNewTask={() => openNewTask("fixed")}
                 onComplete={(task) => openTaskAction("complete", task)}
@@ -1124,6 +1417,8 @@ function App() {
                 setSearch={setSearch}
                 priorityFilter={priorityFilter}
                 setPriorityFilter={setPriorityFilter}
+                taskRoleFilter={taskRoleFilter}
+                setTaskRoleFilter={setTaskRoleFilter}
                 dataLoading={dataLoading}
                 onNewTask={() => openNewTask(activePage)}
                 onEdit={openEditTask}
@@ -1158,6 +1453,8 @@ function App() {
                 performance={performance}
                 analyticsRange={analyticsRange}
                 setAnalyticsRange={setAnalyticsRange}
+                analyticsRoleFilter={analyticsRoleFilter}
+                setAnalyticsRoleFilter={setAnalyticsRoleFilter}
                 dataLoading={dataLoading}
                 historyTasks={historyTasks}
               />
@@ -1165,6 +1462,52 @@ function App() {
           </div>
         </main>
       </div>
+
+      {modal === "alarm" && alarmTask && (
+        <Modal
+          title="It's time to work"
+          subtitle={alarmTask.title}
+          onClose={() => {
+            if (alarmTask) void handleAlarmAction(alarmTask, "snooze");
+            else setModal(null);
+          }}
+        >
+          <div className="alarm-panel">
+            <div className="alarm-panel-icon">
+              <BellRing size={26} />
+            </div>
+            <p className="alarm-panel-description">
+              Your scheduled working window has started. If you don't respond,
+              the backend will repeat reminders every 10 minutes until this
+              window ends.
+            </p>
+            <div className="alarm-time">
+              <Clock3 size={16} />
+              <span>
+                {alarmTask.workingStartTime}–{alarmTask.workingEndTime}
+              </span>
+            </div>
+            <div className="form-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={() => handleAlarmAction(alarmTask, "snooze")}
+              >
+                <Clock3 size={17} />
+                Remind me in 7 minutes
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                onClick={() => handleAlarmAction(alarmTask, "working")}
+              >
+                <Check size={17} />
+                I'm working
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       {modal === "task" && (
         <Modal
@@ -1285,9 +1628,16 @@ function App() {
                     className="input"
                     type="datetime-local"
                     value={taskForm.scheduledFor}
-                    onChange={(event) =>
-                      updateTaskField("scheduledFor", event.target.value)
-                    }
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setTaskForm((current) => ({
+                        ...current,
+                        scheduledFor: value,
+                        workingDate: value
+                          ? value.slice(0, 10)
+                          : current.workingDate,
+                      }));
+                    }}
                     required
                   />
                 </label>
@@ -1301,6 +1651,55 @@ function App() {
                   value={taskForm.dueAt}
                   onChange={(event) =>
                     updateTaskField("dueAt", event.target.value)
+                  }
+                />
+              </label>
+
+              <div className="form-field full-width">
+                <span className="form-label">
+                  Working time & alarm (optional)
+                </span>
+                <span className="form-hint">
+                  Enable a working start and end time to schedule a reminder.
+                  Unanswered push reminders repeat every 10 minutes during the
+                  working window. Daily tasks repeat this window each day.
+                </span>
+              </div>
+
+              {taskForm.category !== "daily" && (
+                <label className="form-field">
+                  <span className="form-label">Working date</span>
+                  <input
+                    className="input"
+                    type="date"
+                    value={taskForm.workingDate}
+                    onChange={(event) =>
+                      updateTaskField("workingDate", event.target.value)
+                    }
+                  />
+                </label>
+              )}
+
+              <label className="form-field">
+                <span className="form-label">Working starts at</span>
+                <input
+                  className="input"
+                  type="time"
+                  value={taskForm.workingStartTime}
+                  onChange={(event) =>
+                    updateTaskField("workingStartTime", event.target.value)
+                  }
+                />
+              </label>
+
+              <label className="form-field">
+                <span className="form-label">Working ends at</span>
+                <input
+                  className="input"
+                  type="time"
+                  value={taskForm.workingEndTime}
+                  onChange={(event) =>
+                    updateTaskField("workingEndTime", event.target.value)
                   }
                 />
               </label>
@@ -1607,6 +2006,8 @@ function DashboardPage({
   analyticsRange,
   setAnalyticsRange,
   dataLoading,
+  onEnableNotifications,
+  notificationStatus,
   onNavigate,
   onNewTask,
   onComplete,
@@ -1628,10 +2029,23 @@ function DashboardPage({
           </p>
         </div>
 
-        <button className="button button-primary" onClick={onNewTask}>
-          <Plus size={18} />
-          New task
-        </button>
+        <div className="dashboard-heading-actions">
+          <button
+            className="button button-secondary"
+            onClick={onEnableNotifications}
+            disabled={notificationStatus === "enabled"}
+            title="Enable background reminders when the browser is closed"
+          >
+            <BellRing size={17} />
+            {notificationStatus === "enabled"
+              ? "Alarms enabled"
+              : "Enable alarm notifications"}
+          </button>
+          <button className="button button-primary" onClick={onNewTask}>
+            <Plus size={18} />
+            New task
+          </button>
+        </div>
       </div>
 
       <div className="stats-grid">
@@ -1947,6 +2361,8 @@ function TasksPage({
   setSearch,
   priorityFilter,
   setPriorityFilter,
+  taskRoleFilter,
+  setTaskRoleFilter,
   dataLoading,
   onNewTask,
   onEdit,
@@ -2021,6 +2437,21 @@ function TasksPage({
             <option value="high">High priority</option>
             <option value="medium">Medium priority</option>
             <option value="low">Low priority</option>
+          </select>
+
+          <label className="sr-only" htmlFor="task-role-filter">
+            Filter by role
+          </label>
+          <select
+            id="task-role-filter"
+            className="select"
+            style={{ width: "auto", minWidth: 145 }}
+            value={taskRoleFilter}
+            onChange={(event) => setTaskRoleFilter(event.target.value)}
+          >
+            <option value="all">All roles</option>
+            <option value="founder">Founder</option>
+            <option value="marketing">Marketing</option>
           </select>
         </div>
 
@@ -2178,6 +2609,16 @@ function TaskCard({ task, onEdit, onComplete, onFail, onDelete }) {
           {task.dueAt && (
             <span className="text-muted">
               Due {formatDate(task.dueAt, true)}
+            </span>
+          )}
+
+          {task.workingStartTime && task.workingEndTime && (
+            <span className="text-muted task-working-window">
+              <BellRing size={14} />
+              {task.category === "daily"
+                ? "Daily"
+                : task.workingDate || "Scheduled"}{" "}
+              · {task.workingStartTime}–{task.workingEndTime}
             </span>
           )}
 
@@ -2402,6 +2843,8 @@ function AnalyticsPage({
   performance,
   analyticsRange,
   setAnalyticsRange,
+  analyticsRoleFilter,
+  setAnalyticsRoleFilter,
   dataLoading,
   historyTasks,
 }) {
@@ -2423,19 +2866,33 @@ function AnalyticsPage({
           </p>
         </div>
 
-        <select
-          className="select"
-          style={{ width: "auto", minWidth: 145 }}
-          value={analyticsRange}
-          onChange={(event) => setAnalyticsRange(event.target.value)}
-          aria-label="Analytics time range"
-        >
-          <option value="week">This week</option>
-          <option value="month">This month</option>
-          <option value="3m">Last 3 months</option>
-          <option value="6m">Last 6 months</option>
-          <option value="12m">Last 12 months</option>
-        </select>
+        <div className="analytics-heading-filters">
+          <select
+            className="select"
+            style={{ width: "auto", minWidth: 145 }}
+            value={analyticsRoleFilter}
+            onChange={(event) => setAnalyticsRoleFilter(event.target.value)}
+            aria-label="Analytics role filter"
+          >
+            <option value="all">All roles</option>
+            <option value="founder">Founder</option>
+            <option value="marketing">Marketing</option>
+          </select>
+
+          <select
+            className="select"
+            style={{ width: "auto", minWidth: 145 }}
+            value={analyticsRange}
+            onChange={(event) => setAnalyticsRange(event.target.value)}
+            aria-label="Analytics time range"
+          >
+            <option value="week">This week</option>
+            <option value="month">This month</option>
+            <option value="3m">Last 3 months</option>
+            <option value="6m">Last 6 months</option>
+            <option value="12m">Last 12 months</option>
+          </select>
+        </div>
       </div>
 
       <div className="stats-grid">

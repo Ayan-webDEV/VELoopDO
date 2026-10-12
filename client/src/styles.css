@@ -1864,3 +1864,100 @@ h3 {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* VELoopDO alarms and role filters — additive styles only */
+
+.dashboard-heading-actions,
+.analytics-heading-filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.task-working-window {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.task-working-window svg {
+  flex: 0 0 auto;
+  color: var(--accent-text);
+}
+
+.alarm-panel {
+  display: grid;
+  gap: 15px;
+}
+
+.alarm-panel-icon {
+  display: grid;
+  width: 58px;
+  height: 58px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-radius: 17px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.alarm-panel-description {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  line-height: 1.7;
+}
+
+.alarm-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: start;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.alarm-time svg {
+  color: var(--accent-text);
+}
+
+@media (max-width: 820px) {
+  .dashboard-heading-actions {
+    width: 100%;
+  }
+
+  .dashboard-heading-actions .button {
+    flex: 1 1 auto;
+  }
+
+  .analytics-heading-filters {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 560px) {
+  .dashboard-heading-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .dashboard-heading-actions .button {
+    width: 100%;
+  }
+
+  .analytics-heading-filters {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    width: 100%;
+  }
+
+  .analytics-heading-filters .select {
+    width: 100% !important;
+  }
+}
