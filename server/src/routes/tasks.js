@@ -1,5 +1,6 @@
 import { Router } from "express";
 import mongoose from "mongoose";
+
 import authenticate from "../middleware/auth.js";
 import Task from "../models/Task.js";
 import User from "../models/User.js";
@@ -139,6 +140,17 @@ async function ensureDailyOccurrences(company, timezone) {
             recurringTemplate: template._id,
             occurrenceDate: today,
             dueAt: template.dueAt,
+            workingDate: today,
+            workingStartTime: template.workingStartTime,
+            workingEndTime: template.workingEndTime,
+            alarmTimezone: template.alarmTimezone || timezone,
+            alarm: {
+              lastReminderAt: null,
+              nextReminderAt: null,
+              workingStartedAt: null,
+              acknowledgedAt: null,
+              reminderCount: 0,
+            },
             recurrence: {
               enabled: false,
               frequency: "daily",
@@ -312,7 +324,6 @@ router.get("/:id/activity", async (req, res, next) => {
   }
 });
 
-// POST /api/tasks
 router.post("/", async (req, res, next) => {
   try {
     const {
@@ -325,6 +336,10 @@ router.post("/", async (req, res, next) => {
       assignedTo = null,
       dueAt: rawDueAt = null,
       scheduledFor: rawScheduledFor = null,
+      workingDate: rawWorkingDate = null,
+      workingStartTime = null,
+      workingEndTime = null,
+      alarmTimezone: rawAlarmTimezone = null,
       recurrenceEndDate: rawRecurrenceEndDate = null,
     } = req.body || {};
 
@@ -360,6 +375,15 @@ router.post("/", async (req, res, next) => {
     const scheduledFor = validDate(rawScheduledFor);
     const recurrenceEndDate = validDate(rawRecurrenceEndDate);
 
+    const workingDate =
+      rawWorkingDate == null || rawWorkingDate === ""
+        ? null
+        : String(rawWorkingDate);
+
+    const alarmTimezone = String(
+      rawAlarmTimezone || req.company.settings?.timezone || "Asia/Kolkata",
+    );
+
     if (
       dueAt === undefined ||
       scheduledFor === undefined ||
@@ -382,6 +406,49 @@ router.post("/", async (req, res, next) => {
       return fail(res, 400, "Future work requires a scheduled date.");
     }
 
+    if (Boolean(workingStartTime) !== Boolean(workingEndTime)) {
+      return fail(res, 400, "Choose both a working start and end time.");
+    }
+
+    if (
+      workingStartTime &&
+      !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(workingStartTime)
+    ) {
+      return fail(res, 400, "Invalid working start time.");
+    }
+
+    if (workingEndTime && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(workingEndTime)) {
+      return fail(res, 400, "Invalid working end time.");
+    }
+
+    if (
+      workingStartTime &&
+      workingEndTime &&
+      workingEndTime <= workingStartTime
+    ) {
+      return fail(
+        res,
+        400,
+        "Working end time must be later than the start time.",
+      );
+    }
+
+    if (
+      workingStartTime &&
+      category !== "daily" &&
+      !/^\d{4}-\d{2}-\d{2}$/.test(workingDate || "")
+    ) {
+      return fail(res, 400, "Choose a working date for this task's alarm.");
+    }
+
+    try {
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: alarmTimezone,
+      });
+    } catch {
+      return fail(res, 400, "Invalid alarm timezone.");
+    }
+
     const timezone = req.company.settings?.timezone || "Asia/Kolkata";
 
     const task = await Task.create({
@@ -396,6 +463,17 @@ router.post("/", async (req, res, next) => {
       assignedTo: assignee,
       dueAt,
       scheduledFor,
+      workingDate: category === "daily" ? null : workingDate,
+      workingStartTime: workingStartTime || null,
+      workingEndTime: workingEndTime || null,
+      alarmTimezone,
+      alarm: {
+        lastReminderAt: null,
+        nextReminderAt: null,
+        workingStartedAt: null,
+        acknowledgedAt: null,
+        reminderCount: 0,
+      },
       priorityOrder: Date.now(),
       recurrence:
         category === "daily"
@@ -456,6 +534,10 @@ router.patch("/:id", async (req, res, next) => {
       "assignedTo",
       "dueAt",
       "scheduledFor",
+      "workingDate",
+      "workingStartTime",
+      "workingEndTime",
+      "alarmTimezone",
     ];
 
     const changes = [];
@@ -481,10 +563,37 @@ router.patch("/:id", async (req, res, next) => {
         }
       }
 
+      if (field === "workingDate") {
+        value = value == null || value === "" ? null : String(value);
+
+        if (value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+          return fail(res, 400, "Invalid working date.");
+        }
+      }
+
+      if (["workingStartTime", "workingEndTime"].includes(field)) {
+        value = value == null || value === "" ? null : String(value);
+
+        if (value && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+          return fail(res, 400, `Invalid ${field}.`);
+        }
+      }
+
+      if (field === "alarmTimezone") {
+        try {
+          new Intl.DateTimeFormat("en-US", {
+            timeZone: String(value),
+          });
+        } catch {
+          return fail(res, 400, "Invalid alarm timezone.");
+        }
+      }
+
       if (field === "title") {
         if (typeof value !== "string" || !value.trim() || value.length > 200) {
           return fail(res, 400, "Invalid task title.");
         }
+
         value = value.trim();
       }
 
@@ -527,6 +636,47 @@ router.patch("/:id", async (req, res, next) => {
       return fail(res, 400, "No editable task fields were provided.");
     }
 
+    if (Boolean(task.workingStartTime) !== Boolean(task.workingEndTime)) {
+      return fail(res, 400, "Choose both a working start and end time.");
+    }
+
+    if (
+      task.workingStartTime &&
+      task.workingEndTime &&
+      task.workingEndTime <= task.workingStartTime
+    ) {
+      return fail(
+        res,
+        400,
+        "Working end time must be later than the start time.",
+      );
+    }
+
+    if (
+      task.workingStartTime &&
+      task.category !== "daily" &&
+      !task.workingDate
+    ) {
+      return fail(res, 400, "Choose a working date for this task's alarm.");
+    }
+
+    if (
+      changes.some(({ field }) =>
+        [
+          "workingDate",
+          "workingStartTime",
+          "workingEndTime",
+          "alarmTimezone",
+        ].includes(field),
+      )
+    ) {
+      task.alarm.lastReminderAt = null;
+      task.alarm.nextReminderAt = null;
+      task.alarm.workingStartedAt = null;
+      task.alarm.acknowledgedAt = null;
+      task.alarm.reminderCount = 0;
+    }
+
     if (task.category === "daily") {
       task.isRecurringTemplate = true;
       task.recurrence.enabled = true;
@@ -562,7 +712,55 @@ router.patch("/:id", async (req, res, next) => {
   }
 });
 
+// POST /api/tasks/:id/reminder-action
+// Acknowledge an alarm or snooze it for seven minutes.
+router.post("/:id/reminder-action", async (req, res, next) => {
+  try {
+    const task = await findTask(req.company._id, req.params.id);
+
+    if (!task || task.status !== "pending" || task.isRecurringTemplate) {
+      return fail(res, 404, "Pending task not found.");
+    }
+
+    const action = req.body?.action;
+    const now = new Date();
+
+    if (action === "working") {
+      task.alarm.workingStartedAt = now;
+      task.alarm.acknowledgedAt = now;
+      task.alarm.nextReminderAt = null;
+    } else if (action === "snooze") {
+      task.alarm.nextReminderAt = new Date(now.getTime() + 7 * 60 * 1000);
+    } else {
+      return fail(res, 400, "Choose working or snooze.");
+    }
+
+    task.revision += 1;
+
+    await task.save();
+
+    await audit(
+      task,
+      req.user._id,
+      "task.updated",
+      action === "working"
+        ? `Started working on task: ${task.title}`
+        : `Snoozed task alarm: ${task.title}`,
+      [{ field: "alarmAction", before: null, after: action }],
+    );
+
+    return res.json({
+      success: true,
+      message: "Alarm preference saved.",
+      task,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 // POST /api/tasks/:id/complete
+
 router.post("/:id/complete", async (req, res, next) => {
   try {
     const task = await findTask(req.company._id, req.params.id);
@@ -600,6 +798,7 @@ router.post("/:id/complete", async (req, res, next) => {
     if (error.name === "ValidationError") {
       return fail(res, 400, error.message);
     }
+
     return next(error);
   }
 });
@@ -652,6 +851,7 @@ router.post("/:id/fail", async (req, res, next) => {
     if (error.name === "ValidationError") {
       return fail(res, 400, error.message);
     }
+
     return next(error);
   }
 });
@@ -708,6 +908,7 @@ router.delete("/:id", async (req, res, next) => {
     if (error.name === "ValidationError") {
       return fail(res, 400, error.message);
     }
+
     return next(error);
   }
 });
@@ -751,6 +952,7 @@ router.post("/:id/restore", async (req, res, next) => {
     if (error.name === "ValidationError") {
       return fail(res, 400, error.message);
     }
+
     return next(error);
   }
 });
@@ -795,6 +997,7 @@ router.post("/:id/reopen", async (req, res, next) => {
     if (error.name === "ValidationError") {
       return fail(res, 400, error.message);
     }
+
     return next(error);
   }
 });

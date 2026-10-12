@@ -81,6 +81,7 @@ function weekKey(date, timezone) {
   const key = localDateKey(date, timezone);
   const local = new Date(`${key}T12:00:00`);
   const day = local.getDay();
+
   local.setDate(local.getDate() - ((day + 6) % 7));
 
   const year = local.getFullYear();
@@ -139,6 +140,7 @@ function createBucketMap(range, start, end, timezone) {
         label: getBucketLabel(key, range),
         completed: 0,
         failed: 0,
+        pending: 0,
       });
 
       cursor.setDate(cursor.getDate() + 1);
@@ -154,6 +156,7 @@ function createBucketMap(range, start, end, timezone) {
         label: getBucketLabel(key, range),
         completed: 0,
         failed: 0,
+        pending: 0,
       });
 
       cursor.setMonth(cursor.getMonth() + 1);
@@ -175,6 +178,7 @@ function incrementBucket(buckets, date, range, timezone, type) {
 }
 
 // GET /api/analytics/overview?range=week|month|3m|6m|12m
+// Optional role filter: ?role=all|founder|marketing
 router.get("/overview", async (req, res, next) => {
   try {
     const range = req.query.range || "month";
@@ -187,6 +191,42 @@ router.get("/overview", async (req, res, next) => {
 
     const timezone = req.company.settings?.timezone || "Asia/Kolkata";
 
+    const role = String(req.query.role || "all").toLowerCase();
+
+    if (!["all", "founder", "marketing"].includes(role)) {
+      return fail(res, 400, "Role must be all, founder, or marketing.");
+    }
+
+    let roleAssigneeIds = null;
+
+    if (role !== "all") {
+      const activeUsers = await User.find({
+        company: companyId,
+        status: "active",
+        archivedAt: null,
+      })
+        .select("_id role designation")
+        .lean();
+
+      roleAssigneeIds = activeUsers
+        .filter((member) => {
+          const designation = String(member.designation || "").toLowerCase();
+
+          const memberRole = String(member.role || "").toLowerCase();
+
+          if (role === "founder") {
+            return (
+              designation.includes("founder") ||
+              designation.includes("ceo") ||
+              ["owner", "ceo"].includes(memberRole)
+            );
+          }
+
+          return designation.includes("marketing");
+        })
+        .map((member) => member._id);
+    }
+
     const period = getRange(range);
     const { start, end } = period;
 
@@ -194,6 +234,7 @@ router.get("/overview", async (req, res, next) => {
     const baseMatch = {
       company: companyId,
       isRecurringTemplate: { $ne: true },
+      ...(roleAssigneeIds ? { assignedTo: { $in: roleAssigneeIds } } : {}),
     };
 
     const [overall, categoryStats, memberStats, periodTasks, members] =
@@ -212,7 +253,9 @@ router.get("/overview", async (req, res, next) => {
           {
             $match: {
               ...baseMatch,
-              status: { $in: ["pending", "completed", "failed"] },
+              status: {
+                $in: ["pending", "completed", "failed"],
+              },
             },
           },
           {
@@ -245,12 +288,16 @@ router.get("/overview", async (req, res, next) => {
         Task.find({
           ...baseMatch,
           $or: [
+            {
+              createdAt: { $gte: start, $lte: end },
+              status: "pending",
+            },
             { completedAt: { $gte: start, $lte: end } },
             { failedAt: { $gte: start, $lte: end } },
           ],
         })
           .select(
-            "category status completedAt completedBy failedAt failedBy createdBy assignedTo",
+            "category status createdAt completedAt completedBy failedAt failedBy createdBy assignedTo",
           )
           .lean(),
 
@@ -280,7 +327,11 @@ router.get("/overview", async (req, res, next) => {
     const categories = Object.fromEntries(
       CATEGORIES.map((category) => [
         category,
-        { pending: 0, completed: 0, failed: 0 },
+        {
+          pending: 0,
+          completed: 0,
+          failed: 0,
+        },
       ]),
     );
 
@@ -310,6 +361,13 @@ router.get("/overview", async (req, res, next) => {
     const performanceByMember = new Map();
 
     for (const member of members) {
+      if (
+        roleAssigneeIds &&
+        !roleAssigneeIds.some((id) => String(id) === String(member._id))
+      ) {
+        continue;
+      }
+
       performanceByMember.set(String(member._id), {
         userId: String(member._id),
         name: member.name,
@@ -322,6 +380,15 @@ router.get("/overview", async (req, res, next) => {
     }
 
     for (const task of periodTasks) {
+      if (
+        task.status === "pending" &&
+        task.createdAt &&
+        task.createdAt >= start &&
+        task.createdAt <= end
+      ) {
+        incrementBucket(buckets, task.createdAt, range, timezone, "pending");
+      }
+
       if (
         task.completedAt &&
         task.completedAt >= start &&
@@ -372,6 +439,7 @@ router.get("/overview", async (req, res, next) => {
     return res.json({
       success: true,
       range,
+      role,
       period: {
         start: start.toISOString(),
         end: end.toISOString(),
@@ -404,6 +472,7 @@ router.get("/members", async (req, res, next) => {
     }
 
     const { start, end } = getRange(range);
+
     const companyId = new mongoose.Types.ObjectId(String(req.company._id));
 
     const [members, completed, failed] = await Promise.all([

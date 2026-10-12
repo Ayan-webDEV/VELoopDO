@@ -9,6 +9,12 @@ import rateLimit from "express-rate-limit";
 import authRoutes from "./routes/auth.js";
 import taskRoutes from "./routes/tasks.js";
 import analyticsRoutes from "./routes/analytics.js";
+import notificationRoutes from "./routes/notifications.js";
+
+import {
+  startReminderScheduler,
+  stopReminderScheduler,
+} from "./services/reminderScheduler.js";
 
 const app = express();
 
@@ -16,7 +22,7 @@ const PORT = Number(process.env.PORT) || 5000;
 const NODE_ENV = process.env.NODE_ENV || "development";
 
 // Allowed frontend origins.
-// CLIENT_ORIGIN can contain multiple comma-separated URLs.
+// CLIENT_ORIGIN supports comma-separated URLs.
 const allowedOrigins = [
   ...(process.env.CLIENT_ORIGIN || "http://localhost:5173").split(","),
   "https://veloopdo.vercel.app",
@@ -29,17 +35,16 @@ app.disable("x-powered-by");
 // Security headers
 app.use(
   helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" },
+    crossOriginResourcePolicy: {
+      policy: "cross-origin",
+    },
   }),
 );
 
-// CORS must run before API routes and rate limiting so browser
-// preflight requests receive the appropriate CORS headers.
+// CORS must be registered before routes and rate limiting.
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow requests without an Origin header, such as server-side
-      // health checks, and explicitly approved frontend origins.
       const normalizedOrigin = origin ? origin.replace(/\/+$/, "") : null;
 
       if (!normalizedOrigin || allowedOrigins.includes(normalizedOrigin)) {
@@ -105,6 +110,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/tasks", taskRoutes);
 app.use("/api/analytics", analyticsRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 // Unknown API routes
 app.use("/api", (req, res) => {
@@ -177,6 +183,8 @@ async function startServer() {
   console.log("VELoopDO MongoDB connected.");
   console.log("Allowed CORS origins:", allowedOrigins);
 
+  startReminderScheduler();
+
   const server = app.listen(PORT, () => {
     console.log(`VELoopDO API listening on port ${PORT}`);
     console.log(`Environment: ${NODE_ENV}`);
@@ -184,6 +192,8 @@ async function startServer() {
 
   async function shutdown(signal) {
     console.log(`${signal} received. Shutting down VELoopDO...`);
+
+    stopReminderScheduler();
 
     server.close(async () => {
       try {

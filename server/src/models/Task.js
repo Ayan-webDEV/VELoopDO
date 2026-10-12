@@ -164,6 +164,60 @@ const taskSchema = new Schema(
       default: "",
     },
 
+    // Local working window used by task alarms.
+    workingDate: {
+      type: String,
+      trim: true,
+      match: /^\d{4}-\d{2}-\d{2}$/,
+      default: null,
+      index: true,
+    },
+
+    workingStartTime: {
+      type: String,
+      trim: true,
+      match: /^(?:[01]\d|2[0-3]):[0-5]\d$/,
+      default: null,
+    },
+
+    workingEndTime: {
+      type: String,
+      trim: true,
+      match: /^(?:[01]\d|2[0-3]):[0-5]\d$/,
+      default: null,
+    },
+
+    alarmTimezone: {
+      type: String,
+      trim: true,
+      default: "Asia/Kolkata",
+    },
+
+    alarm: {
+      lastReminderAt: {
+        type: Date,
+        default: null,
+      },
+      nextReminderAt: {
+        type: Date,
+        default: null,
+        index: true,
+      },
+      workingStartedAt: {
+        type: Date,
+        default: null,
+      },
+      acknowledgedAt: {
+        type: Date,
+        default: null,
+      },
+      reminderCount: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+    },
+
     // Optional deadline for fixed or future work.
     dueAt: {
       type: Date,
@@ -292,6 +346,12 @@ taskSchema.index({
   "recurrence.nextOccurrenceAt": 1,
 });
 
+taskSchema.index({
+  status: 1,
+  "alarm.nextReminderAt": 1,
+  workingDate: 1,
+});
+
 // A template may have only one occurrence per local calendar date.
 taskSchema.index(
   {
@@ -328,6 +388,24 @@ taskSchema.pre("validate", function validateTaskRules() {
     this.invalidate(
       "recurrence.enabled",
       "Only daily tasks can use daily recurrence.",
+    );
+  }
+
+  if (Boolean(this.workingStartTime) !== Boolean(this.workingEndTime)) {
+    this.invalidate(
+      "workingEndTime",
+      "Both working start and end times are required for an alarm.",
+    );
+  }
+
+  if (
+    this.workingStartTime &&
+    this.workingEndTime &&
+    this.workingEndTime <= this.workingStartTime
+  ) {
+    this.invalidate(
+      "workingEndTime",
+      "Working end time must be later than working start time on the same day.",
     );
   }
 
